@@ -30,10 +30,16 @@ func main() {
 		usage()
 	}
 
+	var err error
+
 	if *iamSource {
-		source(args)
+		err = source(args)
 	} else {
-		sink(args[0])
+		err = sink(args[0])
+	}
+
+	if err != nil {
+		os.Exit(1)
 	}
 }
 
@@ -42,32 +48,24 @@ func source(paths []string) error {
 		return err
 	}
 
-	var errors []error
+	var sendErrs []error
 	for _, path := range paths {
 		if err := send(path); err != nil {
-			newErrs := []error{}
-			if accErrs, ok := err.(AccError); ok {
-				newErrs = accErrs.Errors
-				errors = append(errors, newErrs...)
-			} else {
-				newErrs = append(newErrs, err)
-				errors = append(errors, err)
+			if _, ok := err.(FatalError); ok {
+				return err
 			}
-			for _, newErr := range newErrs {
-				if _, ok := newErr.(FatalError); ok {
-					break
-				}
-			}
+			sendErrs = append(sendErrs, err)
 		}
 	}
 
-	if len(errors) > 0 {
-		return AccError{errors}
+	if len(sendErrs) > 0 {
+		return AccError{sendErrs}
 	}
 	return nil
 }
 
-func sink(arg string) {
+func sink(arg string) error {
+	return nil
 }
 
 func send(path string) error {
@@ -138,9 +136,12 @@ func sendDir(dir *os.File, st os.FileInfo) error {
 		return err
 	}
 
-	sendErrs := []error{}
+	var sendErrs []error
 	for _, entry := range content {
 		if err := send(path.Join(dir.Name(), entry)); err != nil {
+			if _, ok := err.(FatalError); ok {
+				return err
+			}
 			sendErrs = append(sendErrs, err)
 		}
 	}
@@ -169,7 +170,7 @@ func sendAttr(st os.FileInfo) error {
 func ack() error {
 	kind := []byte{0}
 	if _, err := os.Stdin.Read(kind); err != nil {
-		return err
+		return FatalError(err.Error())
 	}
 	if kind[0] == 0 {
 		return nil
