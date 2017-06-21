@@ -17,6 +17,8 @@ const (
 	S_IRWXU = 00700
 	S_ISUID = 04000
 	S_ISGID = 02000
+
+	MaxErrLen = 1024
 )
 
 var (
@@ -451,7 +453,12 @@ func teeError(err error) error {
 }
 
 func sendError(err error) {
-	fmt.Fprintf(os.Stdout, "\x01%s\n", strings.Replace(err.Error(), "\n", "; ", -1))
+	line := strings.Replace(err.Error(), "\n", "; ", -1)
+	/* make complete protocol line with zero terminator (i.e \x01%s\n\x00) fit into MaxErrLen buffer */
+	if len(line) > MaxErrLen-3 {
+		line = line[:MaxErrLen-6] + "..."
+	}
+	fmt.Fprintf(os.Stdout, "\x01%s\n", line)
 }
 
 func readLine() (string, error) {
