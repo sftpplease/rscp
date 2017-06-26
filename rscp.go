@@ -327,15 +327,12 @@ func send(name string) error {
 	}
 	name = st.Name()
 
-	switch st.Mode() & os.ModeType {
-	case 0: /* regular file */
-		break
-	case os.ModeDir:
+	if mode := st.Mode(); mode.IsDir() {
 		if *iamRecursive {
 			return sendDir(f, st)
 		}
 		return teeError(errors.New(name + ": is a directory"))
-	default:
+	} else if !mode.IsRegular() {
 		return teeError(errors.New(name + ": not a regular file"))
 	}
 
