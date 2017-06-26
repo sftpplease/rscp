@@ -1,4 +1,4 @@
-package main
+package rscp
 
 import (
 	"io"
@@ -54,7 +54,7 @@ func (w *BwCapWriter) Write(p []byte) (int, error) {
 
 func bwCap(st *BwStats, transfered int) {
 	if transfered <= 0 {
-		return 
+		return
 	}
 	if st.Last.IsZero() {
 		st.Last = time.Now()

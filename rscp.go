@@ -1,8 +1,7 @@
-package main
+package rscp
 
 import (
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -10,6 +9,8 @@ import (
 	"path"
 	"strings"
 	"syscall"
+
+	"github.com/sftpplease/venv"
 )
 
 const (
@@ -18,63 +19,76 @@ const (
 	S_ISUID = 04000
 	S_ISGID = 02000
 
-	MaxErrLen = 1024
+	MaxErrLen        = 1024
 	DirScanBatchSize = 256
 )
 
+type options struct {
+	iamSource     *bool
+	iamSink       *bool
+	bwLimit       *uint
+	iamRecursive  *bool
+	targetDir     *bool
+	preserveAttrs *bool
+	in            io.Reader
+	out           io.Writer
+}
+
 var (
-	iamSource     = flag.Bool("f", false, "Run in source mode")
-	iamSink       = flag.Bool("t", false, "Run in sink mode")
-	bwLimit       = flag.Uint("l", 0, "Limit the bandwidth, specified in Kbit/s")
-	iamRecursive  = flag.Bool("r", false, "Copy directoires recursively following any symlinks")
-	targetDir     = flag.Bool("d", false, "Target should be a directory")
-	preserveAttrs = flag.Bool("p", false, "Preserve modification and access times and mode from original file")
-
 	protocolErr = FatalError("protocol error")
-
-	in io.Reader  = os.Stdin
-	out io.Writer = os.Stdout
 )
 
-func main() {
-	flag.Parse()
-	var args = flag.Args()
+func Main(env *venv.Env) {
 
-	var validMode = (*iamSource || *iamSink) && !(*iamSource && *iamSink)
-	var validArgc = (*iamSource && len(args) > 0) || (*iamSink && len(args) == 1)
-
-	if !validMode || !validArgc {
-		usage()
+	opts := &options{
+		iamSource:     env.Flag.Bool("f", false, "Run in source mode"),
+		iamSink:       env.Flag.Bool("t", false, "Run in sink mode"),
+		bwLimit:       env.Flag.Uint("l", 0, "Limit the bandwidth, specified in Kbit/s"),
+		iamRecursive:  env.Flag.Bool("r", false, "Copy directoires recursively following any symlinks"),
+		targetDir:     env.Flag.Bool("d", false, "Target should be a directory"),
+		preserveAttrs: env.Flag.Bool("p", false, "Preserve modification and access times and mode from original file"),
+		in:            env.Os.Stdin,
+		out:           env.Os.Stdout,
 	}
 
-	if *bwLimit > 0 {
-		st := NewBwStats(*bwLimit * 1024)
-		in = CapReader(in, st)
-		out = CapWriter(out, st)
+	env.Flag.Parse()
+	var args = env.Flag.Args()
+
+	var validMode = (*opts.iamSource || *opts.iamSink) && !(*opts.iamSource && *opts.iamSink)
+	var validArgc = (*opts.iamSource && len(args) > 0) || (*opts.iamSink && len(args) == 1)
+
+	if !validMode || !validArgc {
+		usage(env)
+	}
+
+	if *opts.bwLimit > 0 {
+		st := NewBwStats(*opts.bwLimit * 1024)
+		opts.in = CapReader(opts.in, st)
+		opts.out = CapWriter(opts.out, st)
 	}
 
 	var err error
 
-	if *iamSource {
-		err = source(args)
+	if *opts.iamSource {
+		err = source(env, opts, args)
 	} else {
-		err = sink(args[0], false)
+		err = sink(env, opts, args[0], false)
 	}
 
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		fmt.Fprintln(env.Os.Stderr, err)
+		env.Os.Exit(1)
 	}
 }
 
-func source(paths []string) error {
-	if err := ack(); err != nil {
+func source(env *venv.Env, opts *options, paths []string) error {
+	if err := ack(env, opts); err != nil {
 		return err
 	}
 
 	var sendErrs []error
 	for _, path := range paths {
-		if err := send(path); isFatal(err) {
+		if err := send(env, opts, path); isFatal(err) {
 			return err
 		} else if err != nil {
 			sendErrs = append(sendErrs, err)
@@ -87,31 +101,31 @@ func source(paths []string) error {
 	return nil
 }
 
-func sink(path string, recur bool) error {
+func sink(env *venv.Env, opts *options, path string, recur bool) error {
 	var errs []error
 	var times *FileTimes
 
-	if *targetDir {
-		if st, err := os.Stat(path); err != nil {
-			return teeError(FatalError(err.Error()))
+	if *opts.targetDir {
+		if st, err := env.Os.Stat(path); err != nil {
+			return teeError(env, opts, FatalError(err.Error()))
 		} else if !st.IsDir() {
-			return teeError(FatalError(path + ": is not a directory"))
+			return teeError(env, opts, FatalError(path+": is not a directory"))
 		}
 	}
 
-	if _, err := fmt.Fprint(out, "\x00"); err != nil {
+	if _, err := fmt.Fprint(opts.out, "\x00"); err != nil {
 		return FatalError(err.Error())
 	}
 
 	for first := true; ; first = false {
 		prefix := []byte{0}
-		if _, err := in.Read(prefix); err != nil {
+		if _, err := opts.in.Read(prefix); err != nil {
 			if err == io.EOF {
 				break
 			}
 			return FatalError(err.Error())
 		}
-		line, err := readLine()
+		line, err := readLine(env, opts)
 		if err != nil {
 			return FatalError(err.Error())
 		}
@@ -125,9 +139,9 @@ func sink(path string, recur bool) error {
 
 		case 'E':
 			if !recur {
-				return teeError(protocolErr)
+				return teeError(env, opts, protocolErr)
 			}
-			if _, err := fmt.Fprint(out, "\x00"); err != nil {
+			if _, err := fmt.Fprint(opts.out, "\x00"); err != nil {
 				return FatalError(err.Error())
 			}
 
@@ -139,16 +153,17 @@ func sink(path string, recur bool) error {
 				&times.Mtime.Sec, &times.Mtime.Usec,
 				&times.Atime.Sec, &times.Atime.Usec); err != nil {
 
-				return teeError(FatalError(err.Error()))
+				return teeError(env, opts, FatalError(err.Error()))
 			} else if n != 4 {
-				return teeError(protocolErr)
+				return teeError(env, opts, protocolErr)
 			}
-			if _, err := fmt.Fprint(out, "\x00"); err != nil {
+
+			if _, err := fmt.Fprint(opts.out, "\x00"); err != nil {
 				return FatalError(err.Error())
 			}
 
 		case 'D':
-			if err := sinkDir(path, line, times); isFatal(err) {
+			if err := sinkDir(env, opts, path, line, times); isFatal(err) {
 				return err
 			} else if err != nil {
 				errs = append(errs, err)
@@ -156,7 +171,7 @@ func sink(path string, recur bool) error {
 			times = nil
 
 		case 'C':
-			if err := sinkFile(path, line, times); isFatal(err) {
+			if err := sinkFile(env, opts, path, line, times); isFatal(err) {
 				return err
 			} else if err != nil {
 				errs = append(errs, err)
@@ -169,7 +184,7 @@ func sink(path string, recur bool) error {
 				compLine := append([]byte{prefix[0]}, line...)
 				err = FatalError(string(compLine))
 			}
-			return teeError(err)
+			return teeError(env, opts, err)
 		}
 	}
 
@@ -179,25 +194,25 @@ func sink(path string, recur bool) error {
 	return nil
 }
 
-func sinkDir(parent, line string, times *FileTimes) error {
-	if !*iamRecursive {
-		return teeError(FatalError("received directory without -r flag"))
+func sinkDir(env *venv.Env, opts *options, parent, line string, times *FileTimes) error {
+	if !*opts.iamRecursive {
+		return teeError(env, opts, FatalError("received directory without -r flag"))
 	}
 
 	perm, _, name, err := parseSubj(line)
 	if err != nil {
-		return teeError(FatalError(err.Error()))
+		return teeError(env, opts, FatalError(err.Error()))
 	}
 
 	name = path.Join(parent, name)
 
-	resetPerm, err := prepareDir(name, perm)
+	resetPerm, err := prepareDir(env, opts, name, perm)
 	if err != nil {
-		return teeError(err)
+		return teeError(env, opts, err)
 	}
 
 	var errs []error
-	if err := sink(name, true); isFatal(err) {
+	if err := sink(env, opts, name, true); isFatal(err) {
 		return err
 	} else if err != nil {
 		errs = append(errs, err)
@@ -211,13 +226,13 @@ func sinkDir(parent, line string, times *FileTimes) error {
 		}
 	}
 	if resetPerm {
-		if err := os.Chmod(name, perm); err != nil {
+		if err := env.Os.Chmod(name, perm); err != nil {
 			pendErrs = append(pendErrs, err)
 		}
 	}
 	if len(pendErrs) > 0 {
 		errs = append(errs, pendErrs...)
-		if err := sendError(AccError{pendErrs}); err != nil {
+		if err := sendError(env, opts, AccError{pendErrs}); err != nil {
 			return err
 		}
 	}
@@ -228,39 +243,39 @@ func sinkDir(parent, line string, times *FileTimes) error {
 	return nil
 }
 
-func sinkFile(name, line string, times *FileTimes) error {
+func sinkFile(env *venv.Env, opts *options, name, line string, times *FileTimes) error {
 	perm, size, subj, err := parseSubj(line)
 	if err != nil {
-		return teeError(FatalError(err.Error()))
+		return teeError(env, opts, FatalError(err.Error()))
 	}
 
 	exists := false
-	if st, err := os.Stat(name); err == nil {
+	if st, err := env.Os.Stat(name); err == nil {
 		exists = true
 		if st.IsDir() {
 			name = path.Join(name, subj)
 		}
 	}
 
-	f, err := os.OpenFile(name, os.O_WRONLY|os.O_CREATE, perm|S_IWUSR)
+	f, err := env.Os.OpenFile(name, os.O_WRONLY|os.O_CREATE, perm|S_IWUSR)
 	if err != nil {
-		return teeError(err)
+		return teeError(env, opts, err)
 	}
 	defer f.Close() /* will sync explicitly */
 
 	st, err := f.Stat()
 	if err != nil {
-		return teeError(err)
+		return teeError(env, opts, err)
 	}
 
-	if _, err := fmt.Fprint(out, "\x00"); err != nil {
+	if _, err := fmt.Fprint(opts.out, "\x00"); err != nil {
 		return FatalError(err.Error())
 	}
 
 	var pendErrs []error
-	if wr, err := io.Copy(f, io.LimitReader(in, size)); err != nil {
-		if _, err := io.Copy(ioutil.Discard, io.LimitReader(in, size-wr)); err != nil {
-			return teeError(FatalError(err.Error()))
+	if wr, err := io.Copy(f, io.LimitReader(opts.in, size)); err != nil {
+		if _, err := io.Copy(ioutil.Discard, io.LimitReader(opts.in, size-wr)); err != nil {
+			return teeError(env, opts, FatalError(err.Error()))
 		}
 		pendErrs = append(pendErrs, err)
 	}
@@ -273,7 +288,7 @@ func sinkFile(name, line string, times *FileTimes) error {
 	if err := f.Sync(); err != nil {
 		pendErrs = append(pendErrs, err)
 	}
-	if *preserveAttrs || !exists {
+	if *opts.preserveAttrs || !exists {
 		if err := f.Chmod(perm); err != nil {
 			pendErrs = append(pendErrs, err)
 		}
@@ -286,7 +301,7 @@ func sinkFile(name, line string, times *FileTimes) error {
 		}
 	}
 
-	ackErr := ack()
+	ackErr := ack(env, opts)
 	if isFatal(ackErr) {
 		return ackErr
 	}
@@ -294,11 +309,11 @@ func sinkFile(name, line string, times *FileTimes) error {
 	var sentErr error
 	if len(pendErrs) > 0 {
 		sentErr = AccError{pendErrs}
-		if err := sendError(sentErr); err != nil {
+		if err := sendError(env, opts, sentErr); err != nil {
 			return err
 		}
 	} else {
-		if _, err := fmt.Fprint(out, "\x00"); err != nil {
+		if _, err := fmt.Fprint(opts.out, "\x00"); err != nil {
 			return FatalError(err.Error())
 		}
 	}
@@ -309,19 +324,19 @@ func sinkFile(name, line string, times *FileTimes) error {
 	return sentErr
 }
 
-func prepareDir(name string, perm os.FileMode) (bool, error) {
+func prepareDir(env *venv.Env, opts *options, name string, perm os.FileMode) (bool, error) {
 	resetPerm := false
-	if st, err := os.Stat(name); err == nil {
+	if st, err := env.Os.Stat(name); err == nil {
 		if !st.IsDir() {
 			return resetPerm, errors.New(name + ": is not a directory")
 		}
-		if *preserveAttrs {
-			if err := os.Chmod(name, perm); err != nil {
+		if *opts.preserveAttrs {
+			if err := env.Os.Chmod(name, perm); err != nil {
 				return resetPerm, err
 			}
 		}
 	} else if os.IsNotExist(err) {
-		if err := os.Mkdir(name, perm|S_IRWXU); err != nil {
+		if err := env.Os.Mkdir(name, perm|S_IRWXU); err != nil {
 			return resetPerm, err
 		}
 		resetPerm = true
@@ -331,73 +346,72 @@ func prepareDir(name string, perm os.FileMode) (bool, error) {
 	return resetPerm, nil
 }
 
-func send(name string) error {
-	f, err := os.Open(name)
+func send(env *venv.Env, opts *options, name string) error {
+	f, err := env.Os.Open(name)
 	if err != nil {
-		return teeError(err)
+		return teeError(env, opts, err)
 	}
 	defer f.Close()
 
 	st, err := f.Stat()
 	if err != nil {
-		return teeError(err)
+		return teeError(env, opts, err)
 	}
 	name = st.Name()
 
 	if mode := st.Mode(); mode.IsDir() {
-		if *iamRecursive {
-			return sendDir(f, st)
+		if *opts.iamRecursive {
+			return sendDir(env, opts, f, st)
 		}
-		return teeError(errors.New(name + ": is a directory"))
+		return teeError(env, opts, errors.New(name+": is a directory"))
 	} else if !mode.IsRegular() {
-		return teeError(errors.New(name + ": not a regular file"))
+		return teeError(env, opts, errors.New(name+": not a regular file"))
 	}
 
-	if *preserveAttrs {
-		if err := sendAttr(st); err != nil {
+	if *opts.preserveAttrs {
+		if err := sendAttr(env, opts, st); err != nil {
 			return err
 		}
 	}
 
-	if _, err := fmt.Fprintf(out, "C%04o %d %s\n",
+	if _, err := fmt.Fprintf(opts.out, "C%04o %d %s\n",
 		toPosixPerm(st.Mode()), st.Size(), name); err != nil {
 
 		return FatalError(err.Error())
 	}
-	if err := ack(); err != nil {
+	if err := ack(env, opts); err != nil {
 		return err
 	}
 
-	if sent, err := io.Copy(out, f); err != nil {
+	if sent, err := io.Copy(opts.out, f); err != nil {
 		patch := io.LimitReader(ConstReader(0), st.Size()-sent)
-		if _, err := io.Copy(out, patch); err != nil {
+		if _, err := io.Copy(opts.out, patch); err != nil {
 			return FatalError(err.Error())
 		}
-		if err := ack(); err != nil {
+		if err := ack(env, opts); err != nil {
 			return err
 		}
-		return teeError(err)
+		return teeError(env, opts, err)
 	}
 
-	if _, err := fmt.Fprint(out, "\x00"); err != nil {
+	if _, err := fmt.Fprint(opts.out, "\x00"); err != nil {
 		return FatalError(err.Error())
 	}
-	return ack()
+	return ack(env, opts)
 }
 
-func sendDir(dir *os.File, st os.FileInfo) error {
-	if *preserveAttrs {
-		if err := sendAttr(st); err != nil {
+func sendDir(env *venv.Env, opts *options, dir venv.File, st os.FileInfo) error {
+	if *opts.preserveAttrs {
+		if err := sendAttr(env, opts, st); err != nil {
 			return err
 		}
 	}
 
-	if _, err := fmt.Fprintf(out, "D%04o %d %s\n",
+	if _, err := fmt.Fprintf(opts.out, "D%04o %d %s\n",
 		toPosixPerm(st.Mode()), 0, st.Name()); err != nil {
-
 		return FatalError(err.Error())
 	}
-	if err := ack(); err != nil {
+	if err := ack(env, opts); err != nil {
 		return err
 	}
 
@@ -405,7 +419,7 @@ func sendDir(dir *os.File, st os.FileInfo) error {
 	for {
 		children, err := dir.Readdir(DirScanBatchSize)
 		for _, child := range children {
-			if err := send(path.Join(dir.Name(), child.Name())); isFatal(err) {
+			if err := send(env, opts, path.Join(dir.Name(), child.Name())); isFatal(err) {
 				return err
 			} else if err != nil {
 				sendErrs = append(sendErrs, err)
@@ -414,14 +428,14 @@ func sendDir(dir *os.File, st os.FileInfo) error {
 		if err == io.EOF {
 			break
 		} else if err != nil {
-			return teeError(err)
+			return teeError(env, opts, err)
 		}
 	}
 
-	if _, err := fmt.Fprintf(out, "E\n"); err != nil {
+	if _, err := fmt.Fprintf(opts.out, "E\n"); err != nil {
 		return FatalError(err.Error())
 	}
-	ackErr := ack()
+	ackErr := ack(env, opts)
 	if isFatal(ackErr) {
 		return ackErr
 	}
@@ -448,7 +462,7 @@ func parseSubj(line string) (perm os.FileMode, size int64, name string, err erro
 	return
 }
 
-func sendAttr(st os.FileInfo) error {
+func sendAttr(env *venv.Env, opts *options, st os.FileInfo) error {
 	mtime := st.ModTime().Unix()
 	atime := int64(0)
 
@@ -456,22 +470,22 @@ func sendAttr(st os.FileInfo) error {
 		atime, _ = sysStat.Atim.Unix()
 	}
 
-	if _, err := fmt.Fprintf(out, "T%d 0 %d 0\n", mtime, atime); err != nil {
+	if _, err := fmt.Fprintf(opts.out, "T%d 0 %d 0\n", mtime, atime); err != nil {
 		return FatalError(err.Error())
 	}
-	return ack()
+	return ack(env, opts)
 }
 
-func ack() error {
+func ack(env *venv.Env, opts *options) error {
 	kind := []byte{0}
-	if _, err := in.Read(kind); err != nil {
+	if _, err := opts.in.Read(kind); err != nil {
 		return FatalError(err.Error())
 	}
 	if kind[0] == 0 {
 		return nil
 	}
 
-	l, err := readLine()
+	l, err := readLine(env, opts)
 	if err != nil {
 		return FatalError(err.Error())
 	}
@@ -486,31 +500,31 @@ func ack() error {
 	}
 }
 
-func teeError(err error) error {
-	if err := sendError(err); err != nil {
+func teeError(env *venv.Env, opts *options, err error) error {
+	if err := sendError(env, opts, err); err != nil {
 		return err
 	}
 	return err
 }
 
-func sendError(err error) error {
+func sendError(env *venv.Env, opts *options, err error) error {
 	line := strings.Replace(err.Error(), "\n", "; ", -1)
 	/* make complete protocol line with zero terminator (i.e \x01%s\n\x00) fit into MaxErrLen buffer */
 	if len(line) > MaxErrLen-3 {
 		line = line[:MaxErrLen-6] + "..."
 	}
-	if _, err := fmt.Fprintf(out, "\x01%s\n", line); err != nil {
+	if _, err := fmt.Fprintf(opts.out, "\x01%s\n", line); err != nil {
 		return FatalError(err.Error())
 	}
 	return nil
 }
 
-func readLine() (string, error) {
+func readLine(env *venv.Env, opts *options) (string, error) {
 	l := make([]byte, 0, 64)
 	ch := []byte{0}
 
 	for {
-		if _, err := in.Read(ch); err != nil {
+		if _, err := opts.in.Read(ch); err != nil {
 			return "", err
 		} else {
 			if ch[0] == '\n' {
@@ -545,11 +559,11 @@ func toStdPerm(posixPerm int) os.FileMode {
 	return perm
 }
 
-func usage() {
-	fmt.Fprintf(os.Stderr, "Usage: rscp -f [-pr] [-l limit] file1 ...\n"+
+func usage(env *venv.Env) {
+	fmt.Fprintf(env.Os.Stderr, "Usage: rscp -f [-pr] [-l limit] file1 ...\n"+
 		"       rscp -t [-prd] [-l limit] directory\n")
-	flag.PrintDefaults()
-	os.Exit(1)
+	env.Flag.PrintDefaults()
+	env.Os.Exit(1)
 }
 
 type FileTimes struct {
