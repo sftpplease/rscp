@@ -19,6 +19,7 @@ const (
 	S_ISGID = 02000
 
 	MaxErrLen = 1024
+	DirScanBatchSize = 256
 )
 
 var (
@@ -385,11 +386,6 @@ func send(name string) error {
 }
 
 func sendDir(dir *os.File, st os.FileInfo) error {
-	content, err := dir.Readdirnames(0)
-	if err != nil {
-		return teeError(err)
-	}
-
 	if *preserveAttrs {
 		if err := sendAttr(st); err != nil {
 			return err
@@ -406,12 +402,19 @@ func sendDir(dir *os.File, st os.FileInfo) error {
 	}
 
 	var sendErrs []error
-	for _, entry := range content {
-		if err := send(path.Join(dir.Name(), entry)); err != nil {
-			if _, ok := err.(FatalError); ok {
+	for {
+		children, err := dir.Readdir(DirScanBatchSize)
+		for _, child := range children {
+			if err := send(path.Join(dir.Name(), child.Name())); isFatal(err) {
 				return err
+			} else if err != nil {
+				sendErrs = append(sendErrs, err)
 			}
-			sendErrs = append(sendErrs, err)
+		}
+		if err == io.EOF {
+			break
+		} else if err != nil {
+			return teeError(err)
 		}
 	}
 
