@@ -98,7 +98,9 @@ func sink(path string, recur bool) error {
 		}
 	}
 
-	fmt.Fprint(out, "\x00")
+	if _, err := fmt.Fprint(out, "\x00"); err != nil {
+		return FatalError(err.Error())
+	}
 
 	for first := true; ; first = false {
 		prefix := []byte{0}
@@ -124,7 +126,9 @@ func sink(path string, recur bool) error {
 			if !recur {
 				return teeError(protocolErr)
 			}
-			fmt.Fprint(out, "\x00")
+			if _, err := fmt.Fprint(out, "\x00"); err != nil {
+				return FatalError(err.Error())
+			}
 
 		case 'T':
 			if times == nil {
@@ -138,7 +142,9 @@ func sink(path string, recur bool) error {
 			} else if n != 4 {
 				return teeError(protocolErr)
 			}
-			fmt.Fprint(out, "\x00")
+			if _, err := fmt.Fprint(out, "\x00"); err != nil {
+				return FatalError(err.Error())
+			}
 
 		case 'D':
 			if err := sinkDir(path, line, times); isFatal(err) {
@@ -210,7 +216,9 @@ func sinkDir(parent, line string, times *FileTimes) error {
 	}
 	if len(pendErrs) > 0 {
 		errs = append(errs, pendErrs...)
-		sendError(AccError{pendErrs})
+		if err := sendError(AccError{pendErrs}); err != nil {
+			return err
+		}
 	}
 
 	if len(errs) > 0 {
@@ -244,7 +252,9 @@ func sinkFile(name, line string, times *FileTimes) error {
 		return teeError(err)
 	}
 
-	fmt.Fprint(out, "\x00")
+	if _, err := fmt.Fprint(out, "\x00"); err != nil {
+		return FatalError(err.Error())
+	}
 
 	var pendErrs []error
 	if wr, err := io.Copy(f, io.LimitReader(in, size)); err != nil {
@@ -268,7 +278,9 @@ func sinkFile(name, line string, times *FileTimes) error {
 		}
 	}
 	if times != nil {
-		if err := syscall.Utimes(name, []syscall.Timeval{times.Atime, times.Mtime}); err != nil {
+		if err := syscall.Utimes(name,
+			[]syscall.Timeval{times.Atime, times.Mtime}); err != nil {
+
 			pendErrs = append(pendErrs, err)
 		}
 	}
@@ -281,9 +293,13 @@ func sinkFile(name, line string, times *FileTimes) error {
 	var sentErr error
 	if len(pendErrs) > 0 {
 		sentErr = AccError{pendErrs}
-		sendError(sentErr)
+		if err := sendError(sentErr); err != nil {
+			return err
+		}
 	} else {
-		fmt.Fprint(out, "\x00")
+		if _, err := fmt.Fprint(out, "\x00"); err != nil {
+			return FatalError(err.Error())
+		}
 	}
 
 	if ackErr != nil {
@@ -342,7 +358,11 @@ func send(name string) error {
 		}
 	}
 
-	fmt.Fprintf(out, "C%04o %d %s\n", toPosixPerm(st.Mode()), st.Size(), name)
+	if _, err := fmt.Fprintf(out, "C%04o %d %s\n",
+		toPosixPerm(st.Mode()), st.Size(), name); err != nil {
+
+		return FatalError(err.Error())
+	}
 	if err := ack(); err != nil {
 		return err
 	}
@@ -358,7 +378,9 @@ func send(name string) error {
 		return teeError(err)
 	}
 
-	fmt.Fprint(out, "\x00")
+	if _, err := fmt.Fprint(out, "\x00"); err != nil {
+		return FatalError(err.Error())
+	}
 	return ack()
 }
 
@@ -374,7 +396,11 @@ func sendDir(dir *os.File, st os.FileInfo) error {
 		}
 	}
 
-	fmt.Fprintf(out, "D%04o %d %s\n", toPosixPerm(st.Mode()), 0, st.Name())
+	if _, err := fmt.Fprintf(out, "D%04o %d %s\n",
+		toPosixPerm(st.Mode()), 0, st.Name()); err != nil {
+
+		return FatalError(err.Error())
+	}
 	if err := ack(); err != nil {
 		return err
 	}
@@ -389,7 +415,9 @@ func sendDir(dir *os.File, st os.FileInfo) error {
 		}
 	}
 
-	fmt.Fprintf(out, "E\n")
+	if _, err := fmt.Fprintf(out, "E\n"); err != nil {
+		return FatalError(err.Error())
+	}
 	ackErr := ack()
 	if isFatal(ackErr) {
 		return ackErr
@@ -425,7 +453,9 @@ func sendAttr(st os.FileInfo) error {
 		atime, _ = sysStat.Atim.Unix()
 	}
 
-	fmt.Fprintf(out, "T%d 0 %d 0\n", mtime, atime)
+	if _, err := fmt.Fprintf(out, "T%d 0 %d 0\n", mtime, atime); err != nil {
+		return FatalError(err.Error())
+	}
 	return ack()
 }
 
@@ -454,17 +484,22 @@ func ack() error {
 }
 
 func teeError(err error) error {
-	sendError(err)
+	if err := sendError(err); err != nil {
+		return err
+	}
 	return err
 }
 
-func sendError(err error) {
+func sendError(err error) error {
 	line := strings.Replace(err.Error(), "\n", "; ", -1)
 	/* make complete protocol line with zero terminator (i.e \x01%s\n\x00) fit into MaxErrLen buffer */
 	if len(line) > MaxErrLen-3 {
 		line = line[:MaxErrLen-6] + "..."
 	}
-	fmt.Fprintf(out, "\x01%s\n", line)
+	if _, err := fmt.Fprintf(out, "\x01%s\n", line); err != nil {
+		return FatalError(err.Error())
+	}
+	return nil
 }
 
 func readLine() (string, error) {
